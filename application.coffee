@@ -1,8 +1,14 @@
 dgram = require "dgram"
 server = dgram.createSocket "udp4"
-
+fs = require "fs"
 io = require 'socket.io'
 express = require 'express'
+
+logFile = 'log-' + Date.now() + '.txt'
+logFile2 = 'log-' + Date.now() + '-raw.txt'
+
+console.log "writing to " + logFile
+
 
 process.on 'uncaughtException', (err) ->
     console.log "Type: " + err.type
@@ -136,6 +142,7 @@ TBeaconEnvelope = (msg)->
         when 24
             type: "TBeaconTracker"
             data: TBeaconTracker decrypted
+            button: if decrypted[3] && 2 then true else false
         when 26
             type: "TBeaconTrackerExt"
             data: TBeaconTracker decrypted
@@ -162,9 +169,11 @@ app.listen(8080)
 
 app.configure ()->
     app.set('view engine', 'jade')
+    app.use(express.static(__dirname + '/public'))
+    app.use(express.errorHandler({ dumpExceptions: true, showStack: true }))
 
 app.get '/', (req, res) ->
-    res.render('index', { layout: false })
+    res.redirect("/index.html")
 
 consumer = {}
 lastId = 0
@@ -176,32 +185,58 @@ io.sockets.on 'connection', (socket) ->
     socket.on 'disconnect', -> delete consumer[socketId]
 
 
+writeLogText = (logFile, text)->
+    log = fs.createWriteStream(logFile, {'flags': 'a'})
+    log.write(text)
+    log.end()
+
+writeLog = (logFile, data)->
+    x = {}
+    x[Date.now()] = data
+    writeLogText logFile, JSON.stringify(x) + ",\n"
+
+writeLogText logFile, "{\n"
+writeLogText logFile2, "{\n"
+
 status = {}
 
 server.on "message", (msg, rinfo)->
+    writeLog logFile2, ( msg.readUInt8 i for i in [0..msg.length - 1])
     data = TBeaconLogSighting(msg)
 
     unless data.hdr.icrc16_ok || data.log.icrc_ok
         console.log "INVALID " + msg.inspect()
         return
 
+    beaconInfo = ->
+        seen: {}, strength: {}, button: false
 
     oid = data.log.oid
 
-    status[oid]?= {}
-
     if (data.log.type == 'TBeaconTracker')
-        status[oid]['t' + data.hdr.interface] = data.log.data.strength
+        status[oid]?= beaconInfo()
+        status[oid]['strength']['t' + data.hdr.interface] = data.log.data.strength
+        status[oid]['button'] = data.log.button
     else if (data.log.type == 'TBeaconProxExt')
+        status[oid]?= beaconInfo()
         for b,v of data.log.data.prox
-            status[oid][b] = {seen: Date.now(), strength: v}
+            status[oid]['seen'][b] = {seen: Date.now(), strength: v}
     else
         console.log [data.log.type , JSON.stringify(data.log.raw) , data.hdr.interface , data.log.oid,
             data.log.flags.toString(16), JSON.stringify(data.log.data) ].join(" ")
 
-    for p,i of status[oid]
-        delete status[oid][p] if i.seen < Date.now() - 30000 unless p == 't0' || p == 't1'
+    try
+        delete data['hdr']['icrc16']
+        delete data['hdr']['protocol']
+        delete data['hdr']['icrc16_ok']
+        delete data['log']['icrc']
+        delete data['log']['icrc_ok']
+    catch x
 
+    writeLog logFile, data
+
+    for p,i of status[oid]['seen']
+        delete status[oid]['seen'][p] if i.seen < Date.now() - 5000
 
     for socketId,socket of consumer
         socket().emit('message', status)
